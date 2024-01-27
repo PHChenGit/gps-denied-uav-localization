@@ -17,21 +17,19 @@ import time
 USE_CUDA = torch.cuda.is_available()
 
 class InverseBatch(torch.autograd.Function):
-
-    def forward(self, input):
+    @staticmethod
+    def forward(ctx, input):
         batch_size, h, w = input.size()
         assert(h == w)
         H = torch.Tensor(batch_size, h, h).type_as(input)
         for i in range(0, batch_size):
             H[i, :, :] = input[i, :, :].inverse()
-        # self.save_for_backward(H)
-        self.H = H
+        ctx.save_for_backward(H)
         return H
 
-    def backward(self, grad_output):
-        # print(grad_output.is_contiguous())
-        # H, = self.saved_tensors
-        H = self.H
+    @staticmethod
+    def backward(ctx, grad_output):
+        H = ctx.saved_tensors
 
         [batch_size, h, w] = H.size()
         assert(h == w)
@@ -44,7 +42,7 @@ class InverseBatch(torch.autograd.Function):
             grad_output.contiguous().view(batch_size, 1, 1, h, h).expand(batch_size, h, h, h, h)
         # print(r.size())
         return -r.sum(-1).sum(-1)
-        # print(r)
+
 
 def InverseBatchFun(input):
     batch_size, h, w = input.size()

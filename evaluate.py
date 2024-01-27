@@ -1,25 +1,30 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import models, transforms
+from torch.autograd import Variable
+from torch.nn.functional import grid_sample
+from tqdm import tqdm
+
+import DeepLKBatch as dlk
+import sift_ransac_homography as srh
+from commons import setup_logging
+
 import io
 import requests
 from PIL import Image, ImageFont, ImageDraw
-from torch.autograd import Variable
-from torch.nn.functional import grid_sample
+
 import pdb
 from sys import argv
-import argparse
 import os
+import logging
 import random
-import DeepLKBatch as dlk
 import glob
 from math import cos, sin, pi, sqrt
 import time
 import sys
 import gc
-import numpy as np
-import sift_ransac_homography as srh
 import argparse
 
 # USAGE:
@@ -33,7 +38,7 @@ import argparse
 
 MODE = None
 FOLDER_NAME = None
-DATAPATH = None
+DATA_PATH = None
 MODEL_PATH = None
 VGG_MODEL_PATH = None
 
@@ -64,11 +69,8 @@ training_sz_pad = round(training_sz + training_sz * 2 * warp_pad)
 USE_CUDA = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
 
-###---
-
 def random_param_generator():
     # create random ground truth warp parameters in the specified ranges
-
     scale = random.uniform(min_scale, max_scale)
     angle = random.uniform(-angle_range, angle_range)
     projective_x = random.uniform(-projective_range, projective_range)
@@ -94,10 +96,7 @@ def random_param_generator():
 
 def static_data_generator(batch_size):
     # similar to data_generator, except with static warp parameters (easier for testing)
-
-    FOLDERPATH = DATAPATH + FOLDER
-    FOLDERPATH = FOLDERPATH + 'images/'
-    images_dir = glob.glob(FOLDERPATH + '*.png')
+    images_dir = glob.glob(DATA_PATH)
     random.shuffle(images_dir)
 
     img = Image.open(images_dir[0])
@@ -105,14 +104,9 @@ def static_data_generator(batch_size):
 
     in_W, in_H = img.size
 
-    if USE_CUDA:
-        img_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).cuda()
-        template_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).cuda()
-        param_batch = Variable(torch.zeros(batch_size, 8, 1)).cuda()
-    else:
-        img_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz))
-        template_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz))
-        param_batch = Variable(torch.zeros(batch_size, 8, 1))
+    img_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).to(DEVICE)
+    template_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).to(DEVICE)
+    param_batch = Variable(torch.zeros(batch_size, 8, 1)).to(DEVICE)
 
     for i in range(batch_size):
 
@@ -129,12 +123,8 @@ def static_data_generator(batch_size):
         template_seg_pad = template.crop((loc_x, loc_y, loc_x + seg_sz_pad, loc_y + seg_sz_pad))
         template_seg_pad = template_seg_pad.resize((training_sz_pad, training_sz_pad))
 
-        if USE_CUDA:
-            img_seg_pad = Variable(transforms.ToTensor()(img_seg_pad).cuda())
-            template_seg_pad = Variable(transforms.ToTensor()(template_seg_pad).cuda())
-        else:
-            img_seg_pad = Variable(transforms.ToTensor()(img_seg_pad))
-            template_seg_pad = Variable(transforms.ToTensor()(template_seg_pad))
+        img_seg_pad = Variable(transforms.ToTensor()(img_seg_pad)).to(DEVICE)
+        template_seg_pad = Variable(transforms.ToTensor()(template_seg_pad)).to(DEVICE)
 
         scale = 1.2
         angle = 10
@@ -145,24 +135,14 @@ def static_data_generator(batch_size):
 
         rad_ang = angle / 180 * pi
 
-        if USE_CUDA:
-            p_gt = Variable(torch.Tensor([scale + cos(rad_ang) - 2,
-                                          -sin(rad_ang),
-                                          translation_x,
-                                          sin(rad_ang),
-                                          scale + cos(rad_ang) - 2,
-                                          translation_y,
-                                          projective_x,
-                                          projective_y]).cuda())
-        else:
-            p_gt = Variable(torch.Tensor([scale + cos(rad_ang) - 2,
-                                          -sin(rad_ang),
-                                          translation_x,
-                                          sin(rad_ang),
-                                          scale + cos(rad_ang) - 2,
-                                          translation_y,
-                                          projective_x,
-                                          projective_y]))
+        p_gt = Variable(torch.Tensor([scale + cos(rad_ang) - 2,
+                                      -sin(rad_ang),
+                                      translation_x,
+                                      sin(rad_ang),
+                                      scale + cos(rad_ang) - 2,
+                                      translation_y,
+                                      projective_x,
+                                      projective_y])).to(DEVICE)
 
         p_gt = p_gt.view(8,1)
         p_gt = p_gt.repeat(1,1,1)
@@ -193,19 +173,18 @@ def static_data_generator(batch_size):
     return img_batch, template_batch, param_batch
 
 
-
 def data_generator(batch_size):
-    # create batch of normalized training pairs
+    """
+    create batch of normalized training pairs
 
-    # batch_size [in, int] : number of pairs
-    # img_batch [out, Tensor N x 3 x training_sz x training_sz] : batch of images
-    # template_batch [out, Tensor N x 3 x training_sz x training_sz] : batch of templates
-    # param_batch [out, Tensor N x 8 x 1] : batch of ground truth warp parameters
+    batch_size [in, int] : number of pairs
+    img_batch [out, Tensor N x 3 x training_sz x training_sz] : batch of images
+    template_batch [out, Tensor N x 3 x training_sz x training_sz] : batch of templates
+    param_batch [out, Tensor N x 8 x 1] : batch of ground truth warp parameters
+    """
 
     # randomly choose 2 aligned images
-    FOLDERPATH = DATAPATH + FOLDER
-    FOLDERPATH = FOLDERPATH + 'images/'
-    images_dir = glob.glob(FOLDERPATH + '*.png')
+    images_dir = glob.glob(DATA_PATH)
     random.shuffle(images_dir)
 
     img = Image.open(images_dir[0])
@@ -213,22 +192,12 @@ def data_generator(batch_size):
 
     in_W, in_H = img.size
 
-    # pdb.set_trace()
-
     # initialize output tensors
-
-    if USE_CUDA:
-        img_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).cuda()
-        template_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).cuda()
-        param_batch = Variable(torch.zeros(batch_size, 8, 1)).cuda()
-    else:
-        img_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz))
-        template_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz))
-        param_batch = Variable(torch.zeros(batch_size, 8, 1))
-
+    img_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).to(DEVICE)
+    template_batch = Variable(torch.zeros(batch_size, 3, training_sz, training_sz)).to(DEVICE)
+    param_batch = Variable(torch.zeros(batch_size, 8, 1)).to(DEVICE)
 
     for i in range(batch_size):
-
         # randomly choose size and top left corner of image for sampling
         seg_sz = random.randint(lower_sz, upper_sz)
         seg_sz_pad = round(seg_sz + seg_sz * 2 * warp_pad)
@@ -242,12 +211,8 @@ def data_generator(batch_size):
         template_seg_pad = template.crop((loc_x, loc_y, loc_x + seg_sz_pad, loc_y + seg_sz_pad))
         template_seg_pad = template_seg_pad.resize((training_sz_pad, training_sz_pad))
 
-        if USE_CUDA:
-            img_seg_pad = Variable(transforms.ToTensor()(img_seg_pad).cuda())
-            template_seg_pad = Variable(transforms.ToTensor()(template_seg_pad).cuda())
-        else:
-            img_seg_pad = Variable(transforms.ToTensor()(img_seg_pad))
-            template_seg_pad = Variable(transforms.ToTensor()(template_seg_pad))
+        img_seg_pad = Variable(transforms.ToTensor()(img_seg_pad)).to(DEVICE)
+        template_seg_pad = Variable(transforms.ToTensor()(template_seg_pad)).to(DEVICE)
 
         # create random ground truth
         scale = random.uniform(min_scale, max_scale)
@@ -259,24 +224,14 @@ def data_generator(batch_size):
 
         rad_ang = angle / 180 * pi
 
-        if USE_CUDA:
-            p_gt = Variable(torch.Tensor([scale + cos(rad_ang) - 2,
-                                          -sin(rad_ang),
-                                          translation_x,
-                                          sin(rad_ang),
-                                          scale + cos(rad_ang) - 2,
-                                          translation_y,
-                                          projective_x,
-                                          projective_y]).cuda())
-        else:
-            p_gt = Variable(torch.Tensor([scale + cos(rad_ang) - 2,
-                                          -sin(rad_ang),
-                                          translation_x,
-                                          sin(rad_ang),
-                                          scale + cos(rad_ang) - 2,
-                                          translation_y,
-                                          projective_x,
-                                          projective_y]))
+        p_gt = Variable(torch.Tensor([scale + cos(rad_ang) - 2,
+                                      -sin(rad_ang),
+                                      translation_x,
+                                      sin(rad_ang),
+                                      scale + cos(rad_ang) - 2,
+                                      translation_y,
+                                      projective_x,
+                                      projective_y])).to(DEVICE)
 
         p_gt = p_gt.view(8,1)
         p_gt = p_gt.repeat(1,1,1)
@@ -293,8 +248,6 @@ def data_generator(batch_size):
                     pad_side : pad_side + training_sz,
                     pad_side : pad_side + training_sz]
 
-
-
         template_seg = template_seg_pad[:,
                        pad_side : pad_side + training_sz,
                        pad_side : pad_side + training_sz]
@@ -304,48 +257,28 @@ def data_generator(batch_size):
 
         param_batch[i, :, :] = p_gt[0, :, :].data
 
-    # transforms.ToPILImage()(img_seg_w.data[:, :, :]).show()
-    # time.sleep(2)
-    # transforms.ToPILImage()(template_seg.data[:, :, :]).show()
-
-    # print('angle: ', angle)
-    # print('scale: ', scale)
-    # print('proj_x: ', projective_x)
-    # print('proj_y: ', projective_y)
-    # print('trans_x: ', translation_x)
-    # print('trans_y: ', translation_y)
-
-    # pdb.set_trace()
-
     return img_batch, template_batch, param_batch
 
 
-
 def corner_loss(p, p_gt):
-    # p [in, torch tensor] : batch of regressed warp parameters
-    # p_gt [in, torch tensor] : batch of gt warp parameters
-    # loss [out, float] : sum of corner loss over minibatch
-
+    """
+    p [in, torch tensor] : batch of regressed warp parameters
+    p_gt [in, torch tensor] : batch of gt warp parameters
+    loss [out, float] : sum of corner loss over minibatch
+    """
     batch_size, _, _ = p.size()
 
     # compute corner loss
     H_p = dlk.param_to_H(p)
     H_gt = dlk.param_to_H(p_gt)
 
-    if USE_CUDA:
-        corners = Variable(torch.Tensor([[-training_sz_pad/2, training_sz_pad/2, training_sz_pad/2, -training_sz_pad/2],
-                                         [-training_sz_pad/2, -training_sz_pad/2, training_sz_pad/2, training_sz_pad/2],
-                                         [1, 1, 1, 1]]).cuda())
-    else:
-        corners = Variable(torch.Tensor([[-training_sz_pad/2, training_sz_pad/2, training_sz_pad/2, -training_sz_pad/2],
-                                         [-training_sz_pad/2, -training_sz_pad/2, training_sz_pad/2, training_sz_pad/2],
-                                         [1, 1, 1, 1]]))
+    corners = Variable(torch.Tensor([[-training_sz_pad/2, training_sz_pad/2, training_sz_pad/2, -training_sz_pad/2],
+                                     [-training_sz_pad/2, -training_sz_pad/2, training_sz_pad/2, training_sz_pad/2],
+                                     [1, 1, 1, 1]])).to(DEVICE)
 
     corners = corners.repeat(batch_size, 1, 1)
-
     corners_w_p = H_p.bmm(corners)
     corners_w_gt = H_gt.bmm(corners)
-
     corners_w_p = corners_w_p[:, 0:2, :] / corners_w_p[:, 2:3, :]
     corners_w_gt = corners_w_gt[:, 0:2, :] / corners_w_gt[:, 2:3, :]
 
@@ -354,12 +287,8 @@ def corner_loss(p, p_gt):
     return loss
 
 def test():
-    if USE_CUDA:
-        dlk_vgg16 = dlk.DeepLK(dlk.vgg16Conv(VGG_MODEL_PATH)).cuda()
-        dlk_trained = dlk.DeepLK(dlk.custom_net(MODEL_PATH)).cuda()
-    else:
-        dlk_vgg16 = dlk.DeepLK(dlk.vgg16Conv(VGG_MODEL_PATH))
-        dlk_trained = dlk.DeepLK(dlk.custom_net(MODEL_PATH))
+    dlk_vgg16 = dlk.DeepLK(dlk.vgg16Conv(VGG_MODEL_PATH)).to(DEVICE)
+    dlk_trained = dlk.DeepLK(dlk.custom_net(MODEL_PATH)).to(DEVICE)
 
     testbatch_sz = 1 # keep as 1 in order to compute corner error accurately
     test_rounds_num = 50
@@ -367,33 +296,17 @@ def test():
 
     test_results = np.zeros((test_rounds_num, 5), dtype=float)
 
-    print('Testing...')
-    print('TEST DATA SAVE PATH: ', TEST_DATA_SAVE_PATH)
-    print('DATAPATH: ',DATAPATH)
-    print('FOLDER: ', FOLDER)
-    print('MODEL PATH: ', MODEL_PATH)
-    print('USE CUDA: ', USE_CUDA)
-    print('min_scale: ',  min_scale)
-    print('max_scale: ', max_scale)
-    print('angle_range: ', angle_range)
-    print('projective_range: ', projective_range)
-    print('translation_range: ', translation_range)
-    print('lower_sz: ', lower_sz)
-    print('upper_sz: ', upper_sz)
-    print('warp_pad: ', warp_pad)
-    print('test batch size: ', testbatch_sz, ' number of test round: ', test_rounds_num, ' rounds per pair: ', rounds_per_pair)
+    logging.info(f"Testing...\n save testing data path: {TEST_DATA_SAVE_PATH}, data path: {DATA_PATH}, " \
+                 f"model path: {MODEL_PATH}, device: {DEVICE}, min_scale: {min_scale}, max_scale: {max_scale}" \
+                 f"angle range: {angle_range}, projective range: {projective_range}, translation range: {translation_range}" \
+                 f"lower size: {lower_sz}, upper size: {upper_sz}, warp pad: {warp_pad}, testing batch size: {testbatch_sz}"\
+                 f"number of testing rounds: {test_rounds_num}, rounds per pair: {rounds_per_pair}")
 
-    if USE_CUDA:
-        img_test_data = Variable(torch.zeros(test_rounds_num, 3, training_sz, training_sz)).cuda()
-        template_test_data = Variable(torch.zeros(test_rounds_num, 3, training_sz, training_sz)).cuda()
-        param_test_data = Variable(torch.zeros(test_rounds_num, 8, 1)).cuda()
-    else:
-        img_test_data = Variable(torch.zeros(test_rounds_num, 3, training_sz, training_sz))
-        template_test_data = Variable(torch.zeros(test_rounds_num, 3, training_sz, training_sz))
-        param_test_data = Variable(torch.zeros(test_rounds_num, 8, 1))
+    img_test_data = Variable(torch.zeros(test_rounds_num, 3, training_sz, training_sz)).to(DEVICE)
+    template_test_data = Variable(torch.zeros(test_rounds_num, 3, training_sz, training_sz)).to(DEVICE)
+    param_test_data = Variable(torch.zeros(test_rounds_num, 8, 1)).to(DEVICE)
 
-    for i in range(round(test_rounds_num / rounds_per_pair)):
-        print('gathering data...', i+1, ' / ', test_rounds_num / rounds_per_pair)
+    for i in tqdm(range(round(test_rounds_num / rounds_per_pair))):
         batch_index = i * rounds_per_pair
 
         img_batch, template_batch, param_batch = data_generator(rounds_per_pair)
@@ -402,7 +315,7 @@ def test():
         template_test_data[batch_index:batch_index + rounds_per_pair, :, :, :] = template_batch
         param_test_data[batch_index:batch_index + rounds_per_pair, :, :] = param_batch
 
-        sys.stdout.flush()
+        time.sleep(0.01)
 
     for i in range(test_rounds_num):
         img_batch_unnorm = img_test_data[i, :, :, :].unsqueeze(0)
@@ -420,11 +333,7 @@ def test():
         coarse_param, _ = dlk_vgg16(img_batch_coarse, template_batch_coarse, tol=1e-3, max_itr=70, conv_flag=0)
 
         vgg_loss = corner_loss(vgg_param, param_batch)
-
-        if USE_CUDA:
-            no_op_loss = corner_loss(Variable(torch.zeros(testbatch_sz, 8, 1)).cuda(), param_batch)
-        else:
-            no_op_loss = corner_loss(Variable(torch.zeros(testbatch_sz, 8, 1)), param_batch)
+        no_op_loss = corner_loss(Variable(torch.zeros(testbatch_sz, 8, 1)), param_batch).to(DEVICE)
 
         trained_loss = corner_loss(trained_param, param_batch)
         coarse_loss = corner_loss(coarse_param, param_batch)
@@ -476,65 +385,35 @@ def test():
 
 
 def train():
-    if USE_CUDA:
-        dlk_net = dlk.DeepLK(dlk.vgg16Conv(VGG_MODEL_PATH)).cuda()
-    else:
-        dlk_net = dlk.DeepLK(dlk.vgg16Conv(VGG_MODEL_PATH))
-
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, dlk_net.conv_func.parameters()), lr=0.0001)
-
     best_valid_loss = 0
-
     minibatch_sz = 10
     num_minibatch = 25000
     valid_batch_sz = 10
     valid_num_generator = 50
 
-    print('Training...')
-    print('DATAPATH: ',DATAPATH)
-    print('FOLDER: ', FOLDER)
-    print('MODEL_PATH: ', MODEL_PATH)
-    print('VGG MODEL PATH', VGG_MODEL_PATH)
-    print('USE CUDA: ', USE_CUDA)
-    print('min_scale: ',  min_scale)
-    print('max_scale: ', max_scale)
-    print('angle_range: ', angle_range)
-    print('projective_range: ', projective_range)
-    print('translation_range: ', translation_range)
-    print('lower_sz: ', lower_sz)
-    print('upper_sz: ', upper_sz)
-    print('warp_pad: ', warp_pad)
-    print('training_sz: ', training_sz_pad)
-    print('minibatch size: ', minibatch_sz, ' number of minibatches: ', num_minibatch)
+    logging.info(f"Training...\n data path: {DATA_PATH}, " \
+                 f"model path: {MODEL_PATH}, device: {DEVICE}, min_scale: {min_scale}, max_scale: {max_scale}" \
+                 f"angle range: {angle_range}, projective range: {projective_range}, translation range: {translation_range}" \
+                 f"lower size: {lower_sz}, upper size: {upper_sz}, warp pad: {warp_pad}, minibatch size: {minibatch_sz}"\
+                 f"number of mini batches: {num_minibatch}")
 
-    if USE_CUDA:
-        img_train_data = Variable(torch.zeros(num_minibatch, 3, training_sz, training_sz)).cuda()
-        template_train_data = Variable(torch.zeros(num_minibatch, 3, training_sz, training_sz)).cuda()
-        param_train_data = Variable(torch.zeros(num_minibatch, 8, 1)).cuda()
-    else:
-        img_train_data = Variable(torch.zeros(num_minibatch, 3, training_sz, training_sz))
-        template_train_data = Variable(torch.zeros(num_minibatch, 3, training_sz, training_sz))
-        param_train_data = Variable(torch.zeros(num_minibatch, 8, 1))
+    img_train_data = Variable(torch.zeros(num_minibatch, 3, training_sz, training_sz)).to(DEVICE)
+    template_train_data = Variable(torch.zeros(num_minibatch, 3, training_sz, training_sz)).to(DEVICE)
+    param_train_data = Variable(torch.zeros(num_minibatch, 8, 1)).to(DEVICE)
 
-    for i in range(round(num_minibatch / minibatch_sz)):
-        print('gathering training data...', i+1, ' / ', num_minibatch / minibatch_sz)
+    for i in tqdm(range(round(num_minibatch / minibatch_sz))):
         batch_index = i * minibatch_sz
-
         img_batch, template_batch, param_batch = data_generator(minibatch_sz)
-
         img_train_data[batch_index:batch_index + minibatch_sz, :, :, :] = img_batch
         template_train_data[batch_index:batch_index + minibatch_sz, :, :, :] = template_batch
         param_train_data[batch_index:batch_index + minibatch_sz, :, :] = param_batch
-        sys.stdout.flush()
 
-    if USE_CUDA:
-        valid_img_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 3, training_sz, training_sz)).cuda()
-        valid_template_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 3, training_sz, training_sz)).cuda()
-        valid_param_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 8, 1)).cuda()
-    else:
-        valid_img_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 3, training_sz, training_sz))
-        valid_template_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 3, training_sz, training_sz))
-        valid_param_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 8, 1))
+    dlk_net = dlk.DeepLK(dlk.vgg16Conv(VGG_MODEL_PATH)).to(DEVICE)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, dlk_net.conv_func.parameters()), lr=0.0001)
+
+    valid_img_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 3, training_sz, training_sz)).to(DEVICE)
+    valid_template_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 3, training_sz, training_sz)).to(DEVICE)
+    valid_param_batch = Variable(torch.zeros(valid_batch_sz * valid_num_generator, 8, 1)).to(DEVICE)
 
     for i in range(valid_num_generator):
         print('gathering validation data...', i+1, ' / ', valid_num_generator)
@@ -583,21 +462,22 @@ def train():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("MODE")
-    parser.add_argument("FOLDER_NAME")
-    parser.add_argument("DATA_FOLDER")
-    parser.add_argument("MODEL_PATH")
-    parser.add_argument("VGG_MODEL_PATH")
-    parser.add_argument("-t","--TEST_DATA_SAVE_PATH")
+    parser.add_argument("--mode")
+    parser.add_argument("--datasets_folder")
+    parser.add_argument("--model_path")
+    parser.add_argument("--vgg_model_path")
+    parser.add_argument("--testing_data_dave_path")
 
     args = parser.parse_args()
 
-    MODE = args.MODE
-    FOLDER_NAME = args.FOLDER_NAME
-    DATA_FOLDER = args.DATA_FOLDER
-    DATA_PATH = f"{DATA_FOLDER}/{FOLDER_NAME}/images/*.png"
-    MODEL_PATH = args.MODEL_PATH
-    VGG_MODEL_PATH = args.VGG_MODEL_PATH
+    MODE = args.mode
+    DATASETS_FOLDER = args.datasets_folder
+    DATA_PATH = f"{DATASETS_FOLDER}/{FOLDER_NAME}/images/*.png"
+    MODEL_PATH = args.model_path
+    VGG_MODEL_PATH = args.vgg_model_path
+    TEST_DATA_SAVE_PATH = args.testing_data_dave_path
+
+    setup_logging("logs")
 
     if MODE == 'test':
         if args.TEST_DATA_SAVE_PATH == None:
